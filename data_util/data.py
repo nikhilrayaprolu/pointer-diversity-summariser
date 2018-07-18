@@ -7,6 +7,7 @@ import csv
 from tensorflow.core.example import example_pb2
 
 # <s> and </s> are used in the data files to segment the abstracts into sentences. They don't receive vocab ids.
+
 SENTENCE_START = '<s>'
 SENTENCE_END = '</s>'
 
@@ -143,7 +144,11 @@ def outputids2words(id_list, vocab, article_oovs):
   return words
 
 
-def abstract2sents(abstract):
+def abstract2sents(abstract, diversity = False):
+  if diversity:
+    SENTENCE_START = '<s>'
+    SENTENCE_END = '<eos>'
+
   cur = 0
   sents = []
   while True:

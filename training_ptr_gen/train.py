@@ -39,8 +39,10 @@ class Train(object):
         state = {
             'iter': iter,
             'encoder_state_dict': self.model.encoder.state_dict(),
+            'query_encoder_state_dict': self.model.query_encoder.state_dict(),
             'decoder_state_dict': self.model.decoder.state_dict(),
             'reduce_state_dict': self.model.reduce_state.state_dict(),
+            'query_reduce_state_dict': self.model.query_reduce_state.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'current_loss': running_avg_loss
         }
@@ -50,8 +52,8 @@ class Train(object):
     def setup_train(self, model_file_path=None):
         self.model = Model(model_file_path)
 
-        params = list(self.model.encoder.parameters()) + list(self.model.decoder.parameters()) + \
-                 list(self.model.reduce_state.parameters())
+        params = list(self.model.encoder.parameters()) + list(self.model.query_encoder.parameters()) + list(self.model.decoder.parameters()) + \
+                 list(self.model.reduce_state.parameters()) + list(self.model.query_reduce_state.parameters())
         initial_lr = config.lr_coverage if config.is_coverage else config.lr
         self.optimizer = AdagradCustom(params, lr=initial_lr, initial_accumulator_value=config.adagrad_init_acc)
 
@@ -73,7 +75,7 @@ class Train(object):
         return start_iter, start_loss
 
     def train_one_batch(self, batch):
-        enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1, coverage = \
+        enc_batch,query_enc_batch, enc_padding_mask, query_enc_padding_mask, enc_lens,query_enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1, coverage = \
             get_input_from_batch(batch, use_cuda)
         dec_batch, dec_padding_mask, max_dec_len, dec_lens_var, target_batch = \
             get_output_from_batch(batch, use_cuda)
@@ -81,15 +83,19 @@ class Train(object):
         self.optimizer.zero_grad()
 
         encoder_outputs, encoder_hidden, max_encoder_output = self.model.encoder(enc_batch, enc_lens)
+        query_encoder_outputs, query_encoder_hidden, max_query_encoder_output = self.model.query_encoder(query_enc_batch, query_enc_lens)
         s_t_1 = self.model.reduce_state(encoder_hidden)
+        q_s_t_1 = self.model.query_reduce_state(query_encoder_hidden)
+
+
         if config.use_maxpool_init_ctx:
             c_t_1 = max_encoder_output
 
         step_losses = []
         for di in range(min(max_dec_len, config.max_dec_steps)):
             y_t_1 = dec_batch[:, di]  # Teacher forcing
-            final_dist, s_t_1,  c_t_1, attn_dist, p_gen, coverage = self.model.decoder(y_t_1, s_t_1,
-                                                        encoder_outputs, enc_padding_mask, c_t_1,
+            final_dist, s_t_1,  c_t_1, attn_dist, p_gen, coverage = self.model.decoder(y_t_1, s_t_1,q_s_t_1,
+                                                        encoder_outputs,query_encoder_outputs, enc_padding_mask,query_enc_padding_mask, c_t_1,
                                                         extra_zeros, enc_batch_extend_vocab,
                                                                            coverage)
             target = target_batch[:, di]
@@ -109,8 +115,10 @@ class Train(object):
         loss.backward()
 
         clip_grad_norm(self.model.encoder.parameters(), config.max_grad_norm)
+        clip_grad_norm(self.model.query_encoder.parameters(), config.max_grad_norm)
         clip_grad_norm(self.model.decoder.parameters(), config.max_grad_norm)
         clip_grad_norm(self.model.reduce_state.parameters(), config.max_grad_norm)
+        clip_grad_norm(self.model.query_reduce_state.parameters(), config.max_grad_norm)
 
         self.optimizer.step()
 

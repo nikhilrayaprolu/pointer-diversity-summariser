@@ -17,42 +17,45 @@ random.seed(1234)
 
 class Example(object):
 
-  def __init__(self, article, abstract_sentences, vocab):
+  def __init__(self, content, query, summary, vocab):
     # Get ids of special tokens
     start_decoding = vocab.word2id(data.START_DECODING)
     stop_decoding = vocab.word2id(data.STOP_DECODING)
 
     # Process the article
-    article_words = article.split()
-    if len(article_words) > config.max_enc_steps:
-      article_words = article_words[:config.max_enc_steps]
-    self.enc_len = len(article_words) # store the length after truncation but before padding
-    self.enc_input = [vocab.word2id(w) for w in article_words] # list of word ids; OOVs are represented by the id for UNK token
-
+    content_words = content.split()
+    query_words = query.split()
+    summary_words = summary.split()
+    if len(content_words) > config.max_enc_steps:
+      content_words = content_words[:config.max_enc_steps]
+    self.enc_len = len(content_words) # store the length after truncation but before padding
+    self.enc_input = [vocab.word2id(w) for w in content_words] # list of word ids; OOVs are represented by the id for UNK token
+    self.query_enc_input = [vocab.word2id(w) for w in query_words]
     # Process the abstract
-    abstract = ' '.join(abstract_sentences) # string
-    abstract_words = abstract.split() # list of strings
-    abs_ids = [vocab.word2id(w) for w in abstract_words] # list of word ids; OOVs are represented by the id for UNK token
+    
+    
+    summary_ids = [vocab.word2id(w) for w in summary_words] # list of word ids; OOVs are represented by the id for UNK token
 
     # Get the decoder input sequence and target sequence
-    self.dec_input, self.target = self.get_dec_inp_targ_seqs(abs_ids, config.max_dec_steps, start_decoding, stop_decoding)
+    self.dec_input, self.target = self.get_dec_inp_targ_seqs(summary_ids, config.max_dec_steps, start_decoding, stop_decoding)
     self.dec_len = len(self.dec_input)
 
     # If using pointer-generator mode, we need to store some extra info
     if config.pointer_gen:
       # Store a version of the enc_input where in-article OOVs are represented by their temporary OOV id; also store the in-article OOVs words themselves
-      self.enc_input_extend_vocab, self.article_oovs = data.article2ids(article_words, vocab)
+      self.enc_input_extend_vocab, self.content_oovs = data.article2ids(content_words, vocab)
 
       # Get a verison of the reference summary where in-article OOVs are represented by their temporary article OOV id
-      abs_ids_extend_vocab = data.abstract2ids(abstract_words, vocab, self.article_oovs)
+      abs_ids_extend_vocab = data.abstract2ids(summary_words, vocab, self.content_oovs)
 
       # Overwrite decoder target sequence so it uses the temp article OOV ids
       _, self.target = self.get_dec_inp_targ_seqs(abs_ids_extend_vocab, config.max_dec_steps, start_decoding, stop_decoding)
 
     # Store the original strings
-    self.original_article = article
-    self.original_abstract = abstract
-    self.original_abstract_sents = abstract_sentences
+    self.original_content = content
+    self.original_query = query
+    self.original_summary = summary
+    
 
 
   def get_dec_inp_targ_seqs(self, sequence, max_len, start_id, stop_id):
@@ -112,12 +115,18 @@ class Batch(object):
       for j in xrange(ex.enc_len):
         self.enc_padding_mask[i][j] = 1
 
+      self.query_enc_batch[i, :] = ex.query_enc_input[:]
+      self.query_enc_lens[i] = ex.query_enc_len
+      for j in xrange(ex.query_enc_len):
+        self.query_enc_padding_mask[i][j] = 1
+
+
     # For pointer-generator mode, need to store some extra info
     if config.pointer_gen:
       # Determine the max number of in-article OOVs in this batch
-      self.max_art_oovs = max([len(ex.article_oovs) for ex in example_list])
+      self.max_con_oovs = max([len(ex.content_oovs) for ex in example_list])
       # Store the in-article OOVs themselves
-      self.art_oovs = [ex.article_oovs for ex in example_list]
+      self.con_oovs = [ex.content_oovs for ex in example_list]
       # Store the version of the enc_batch that uses the article OOV ids
       self.enc_batch_extend_vocab = np.zeros((self.batch_size, max_enc_seq_len), dtype=np.int32)
       for i, ex in enumerate(example_list):
@@ -143,15 +152,15 @@ class Batch(object):
         self.dec_padding_mask[i][j] = 1
 
   def store_orig_strings(self, example_list):
-    self.original_articles = [ex.original_article for ex in example_list] # list of lists
-    self.original_abstracts = [ex.original_abstract for ex in example_list] # list of lists
-    self.original_abstracts_sents = [ex.original_abstract_sents for ex in example_list] # list of list of lists
-
+    self.original_content = [ex.original_content for ex in example_list] # list of lists
+    self.original_query = [ex.original_query for ex in example_list] # list of lists
+    self.original_summary = [ex.original_summary for ex in example_list] # list of lists
+    
 
 class Batcher(object):
   BATCH_QUEUE_MAX = 100 # max number of batches the batch_queue can hold
 
-  def __init__(self, data_path, vocab, mode, batch_size, single_pass):
+  def __init__(self, data_path, vocab, mode, batch_size, single_pass, diversity=False):
     self._data_path = data_path
     self._vocab = vocab
     self._single_pass = single_pass
@@ -202,11 +211,11 @@ class Batcher(object):
     return batch
 
   def fill_example_queue(self):
-    input_gen = self.text_generator(data.example_generator(self._data_path, self._single_pass))
+    input_gen = self.text_generator()
 
     while True:
       try:
-        (article, abstract) = input_gen.next() # read the next example from file. article and abstract are both strings.
+        (content, query, summary) = input_gen.next() # read the next example from file. article and abstract are both strings.
       except StopIteration: # if there are no more examples:
         tf.logging.info("The example generator for this example queue filling thread has exhausted data.")
         if self._single_pass:
@@ -216,8 +225,11 @@ class Batcher(object):
         else:
           raise Exception("single_pass mode is off but the example generator is out of data; error.")
 
-      abstract_sentences = [sent.strip() for sent in data.abstract2sents(abstract)] # Use the <s> and </s> tags in abstract to get a list of sentences.
-      example = Example(article, abstract_sentences, self._vocab) # Process into an Example.
+      content_sentence = [sent.strip() for sent in data.abstract2sents(content)] # Use the <s> and </s> tags in abstract to get a list of sentences.
+      query_sentence = [sent.strip() for sent in data.abstract2sents(query)]
+      summary_sentence = [sent.strip() for sent in data.abstract2sents(summary)]
+
+      example = Example(content_sentence,query_sentence, summary_sentence, self._vocab) # Process into an Example.
       self._example_queue.put(example) # place the Example in the example queue.
 
   def fill_batch_queue(self):
@@ -266,17 +278,23 @@ class Batcher(object):
           new_t.start()
 
 
-  def text_generator(self, example_generator):
+  def text_generator(self, type="train"):
     while True:
-      e = example_generator.next() # e is a tf.Example
-      try:
-        article_text = e.features.feature['article'].bytes_list.value[0] # the article text was saved under the key 'article' in the data files
-        abstract_text = e.features.feature['abstract'].bytes_list.value[0] # the abstract text was saved under the key 'abstract' in the data files
-      except ValueError:
-        tf.logging.error('Failed to get article or abstract from example')
-        continue
-      if len(article_text)==0: # See https://github.com/abisee/pointer-generator/issues/1
-        #tf.logging.warning('Found an example with empty article text. Skipping it.')
-        continue
-      else:
-        yield (article_text, abstract_text)
+      for i in range(1,11):
+        content_file = open(os.path.join("data/"+str(i), type+"_content"))
+        query_file = open(os.path.join("data/"+str(i), type+"_query"))
+        summary_file = open(os.path.join("data/"+str(i), type+"_summary"))
+        while True:
+          try:
+            content_text = content_file.next()
+            query_text = query_file.next()
+            summary_text = summary_file.next()
+          except ValueError:
+            tf.logging.error('Failed to get content or query or summary from files')
+            continue
+          except StopIteration:
+            tf.logging.error('Stopped data Iteration')
+            break
+          
+          yield (content_text, query_text, summary_text)
+
